@@ -1,46 +1,34 @@
-import time
-import hashlib
 import json
 import asyncio
 import lark_oapi as lark
-from lark_oapi.adapter.fastapi import FastAPIAdapter
-from fastapi import FastAPI, Request
-from lark_oapi.api.im.v1 import P2ImMessageResource
+from lark_oapi.im.p2.message_reader import IrpMessageReader
+from lark_oapi.im.p2.event_callback import IEventCallback
 
-from config import (
-    FEISHU_VERIFICATION_TOKEN,
-    FEISHU_ENCRYPT_KEY,
-    HOST,
-    PORT,
-)
+from config import FEISHU_APP_ID, FEISHU_APP_SECRET
 from claude_client import generate_response
-from feishu_client import send_message, reply_message
-
-app = FastAPI(title="claude-lark")
-adapter = FastAPIAdapter(
-    token=FEISHU_VERIFICATION_TOKEN,
-    encrypt_key=FEISHU_ENCRYPT_KEY,
-    handler=FastAppHandler(app),
-)
+from feishu_client import reply_message
 
 # 简易会话历史存储 (chat_id -> list of messages)
 chat_histories: dict[str, list[dict]] = {}
 
+# 最小 FastAPI app（保持进程存活 + 健康检查）
+from fastapi import FastAPI
+app = FastAPI(title="claude-lark")
 
-class FastAppHandler:
-    """处理飞书事件"""
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "claude-lark"}
 
-    async def event_handler(
-        self, ctx: lark.ctx.EventContext, request: lark.irp.SubscribeEventReq
-    ):
-        """事件分发"""
-        event = request.event
-        event_type = request.header.event_type
+
+class MessageHandler(IEventCallback):
+    """处理飞书消息事件"""
+
+    async def on_event(self, ctx: lark.ctx.IrpContext, event: bytes):
+        event_body = json.loads(event)
+        event_type = event_body.get("header", {}).get("event_type", "")
 
         if event_type == "im.message.receive_v1":
-            await self._handle_message(ctx, event)
-
-        return ctx.next()
+            await self._handle_message(ctx, event_body)
 
     async def _handle_message(self, ctx, event):
         """处理收到的消息"""
@@ -49,9 +37,12 @@ class FastAppHandler:
         msg_type = message.get("type", "")
         message_id = message.get("message_id", "")
 
-        # 只处理文本消息，且忽略机器人自己的消息
+        # 忽略机器人自己的消息
         sender = message.get("sender", {}).get("sender_id", {})
-        if msg_type != "text" or sender.get("user_id") or sender.get("app_id"):
+        if sender.get("user_id") or sender.get("app_id"):
+            return
+
+        if msg_type != "text":
             return
 
         text = message.get("content", "{}")
@@ -63,7 +54,7 @@ class FastAppHandler:
             return
 
         # 读取会话历史
-        history = chat_histories.get(chat_id, [])[-10:]  # 保留最近10轮
+        history = chat_histories.get(chat_id, [])[-10:]
 
         # 调用 Claude 生成回复
         reply_text = await generate_response(user_message, history)
@@ -77,18 +68,46 @@ class FastAppHandler:
         await reply_message(message_id, reply_text)
 
 
-# 飞书事件订阅路由
-@app.api_route("/event", methods=["GET", "POST"])
-async def feishu_event(request: Request):
-    return await adapter.handle(request)
+async def run():
+    handler = MessageHandler()
+    message_reader = IrpMessageReader(
+        app_id=FEISHU_APP_ID,
+        app_secret=FEISHU_APP_SECRET,
+        event_callback=handler,
+    )
 
+    print("正在连接飞书长连接服务...")
+    await message_reader.start()
+    print("已连接，等待消息...")
 
-# 健康检查
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "claude-lark"}
+    # 保持运行
+    while True:
+        await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
+    from config import HOST, PORT
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
+
+    print("正在连接飞书长连接服务...")
+
+    async def main():
+        handler = MessageHandler()
+        message_reader = IrpMessageReader(
+            app_id=FEISHU_APP_ID,
+            app_secret=FEISHU_APP_SECRET,
+            event_callback=handler,
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app, host=HOST, port=PORT, log_level="warning"
+            )
+        )
+        server_task = asyncio.create_task(server.serve())
+        await message_reader.start()
+        await server_task
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n已停止")
