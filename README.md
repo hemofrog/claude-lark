@@ -58,8 +58,16 @@ python main.py
 
 在飞书群聊中 @机器人 发送消息即可。
 
+## 变更记录
+
+### 2026-04-22
+- 从 IRP 长连接模式切换回 WebSocket 长连接模式，使用 `EventDispatcherHandlerBuilder` 和 `Client`
+- 重构消息处理逻辑，使用同步函数在后台线程运行
+- 新增 FastAPI `/health` 健康检查接口
+- 依赖版本约束从精确 pin 改为范围约束
+
 ## 技术栈
 
 - Python + FastAPI
-- 飞书长连接（lark-oapi SDK）
+- 飞书长连接（lark-oapi SDK，WebSocket 模式）
 - Anthropic Claude API
